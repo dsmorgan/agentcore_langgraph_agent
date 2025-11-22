@@ -18,8 +18,8 @@ from tools import load_search_tools
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-langchain_logger = logging.getLogger("langchain")
-langchain_logger.setLevel(logging.DEBUG)
+langgraph_logger = logging.getLogger("langgraph")
+langgraph_logger.setLevel(logging.DEBUG)
 
 # Log critical library versions on initialization
 from importlib.metadata import version, PackageNotFoundError
