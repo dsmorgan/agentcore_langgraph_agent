@@ -21,7 +21,7 @@ uv pip install -r requirements.txt
 # Configure your agent for deployment
 agentcore configure
 
-# Deploy your agent
+# Deploy the agent into AWS, use --local flag for local development
 agentcore launch
 ```
 
@@ -39,7 +39,11 @@ During configure, you'll be prompted for:
     - default request header configuration
 
 
+## Tools
+- Wikipedia
+- Tavily
 
+For local development, you can store the Tavily API key in .env but for AWS, that won't work. In that case you can either use AWS secrets manager, or store it as an environmental variable in the Agent Runtime, under advanced configuration.
 
 
 

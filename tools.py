@@ -77,16 +77,16 @@ def load_search_tools() -> List:
     tavily_api_key = load_tavily_api_key()
     if tavily_api_key:
         try:
-            from langchain_community.tools.tavily_search import TavilySearchResults
-            tavily_search = TavilySearchResults(
+            from langchain_tavily import TavilySearch
+            tavily_search = TavilySearch(
                 max_results=5,
                 search_depth="basic",
-                tavily_api_key=tavily_api_key
+                api_key=tavily_api_key
             )
             tools.append(tavily_search)
             logger.info("Tavily search tool loaded successfully")
         except ImportError as e:
-            logger.warning(f"Could not import TavilySearchResults: {e}")
+            logger.warning(f"Could not import TavilySearch: {e}")
         except Exception as e:
             logger.warning(f"Failed to initialize Tavily search tool: {e}")
     else:
