@@ -80,8 +80,8 @@ class State(TypedDict):
 graph_builder = StateGraph(State)
 
 
-def chatbot(state: State):
-    return {"messages": [llm_with_tools.invoke(state["messages"])]}
+async def chatbot(state: State):
+    return {"messages": [await llm_with_tools.ainvoke(state["messages"])]}
 
 
 logger.info("Configuring graph...")
@@ -112,15 +112,18 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 app = BedrockAgentCoreApp()
 
 @app.entrypoint
-def agent_invocation(payload, context):
+async def agent_invocation(payload, context):
     """
     Agent invocation handler with session and memory persistence.
+
+    Supports both streaming and non-streaming responses based on payload flag.
 
     Expected payload:
     {
         "prompt": "User question",
         "session_id": "optional-session-id",
-        "actor_id": "optional-user-id"
+        "actor_id": "optional-user-id",
+        "stream": false  # optional, defaults to false
     }
     """
     logger.info("Received payload")
@@ -130,8 +133,9 @@ def agent_invocation(payload, context):
     session_id = payload.get("session_id") or str(uuid.uuid4())
     actor_id = payload.get("actor_id", "default-user")
     prompt = payload.get("prompt", "No prompt found in input, please guide customer as to what tools can be used")
+    stream_mode = payload.get("stream", False)
 
-    logger.info(f"Session: {session_id}, Actor: {actor_id}")
+    logger.info(f"Session: {session_id}, Actor: {actor_id}, Streaming: {stream_mode}")
 
     # Prepare messages for graph invocation
     messages = [{"role": "user", "content": prompt}]
@@ -175,12 +179,130 @@ def agent_invocation(payload, context):
         except Exception as e:
             logger.warning(f"Failed to retrieve long-term memories: {e}")
 
-    # Invoke graph with session config and messages
+    # Route to streaming or non-streaming handler
+    if stream_mode:
+        # Streaming mode: use async generator - must yield all events
+        async for event in _stream_invocation(messages, config, session_id, actor_id, prompt):
+            yield event
+        # In streaming mode, we don't return - just finish the generator
+    else:
+        # Non-streaming mode: delegate to separate function and yield single result
+        # This allows the function to work as both generator and regular async function
+        result = await _invoke_non_streaming(messages, config, session_id, actor_id, prompt)
+        yield result
+
+
+async def _stream_invocation(messages, config, session_id, actor_id, prompt):
+    """Handle streaming invocation."""
     try:
+        logger.info("Starting streaming invocation")
+
+        # Accumulate response for memory saving
+        assistant_response = ""
+
+        # Stream events from the graph
+        async for event in graph.astream_events(
+            {"messages": messages},
+            config=config if config else {},
+            version="v2"
+        ):
+            kind = event.get("event")
+
+            # Stream LLM token chunks to client
+            if kind == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                if chunk and hasattr(chunk, "content"):
+                    content = chunk.content
+                    # Content can be a string or list of content blocks
+                    if isinstance(content, str) and content:
+                        assistant_response += content
+                        # Yield token chunk with metadata
+                        yield {
+                            "type": "content_chunk",
+                            "content": content,
+                            "session_id": session_id
+                        }
+                    elif isinstance(content, list):
+                        # Handle list of content blocks (e.g., from tool use models)
+                        for block in content:
+                            if isinstance(block, dict) and "text" in block:
+                                text = block["text"]
+                                assistant_response += text
+                                yield {
+                                    "type": "content_chunk",
+                                    "content": text,
+                                    "session_id": session_id
+                                }
+                            elif hasattr(block, "text"):
+                                text = block.text
+                                assistant_response += text
+                                yield {
+                                    "type": "content_chunk",
+                                    "content": text,
+                                    "session_id": session_id
+                                }
+
+            # Show tool execution status (optional visibility)
+            elif kind == "on_tool_start":
+                tool_name = event.get("name", "unknown")
+                logger.info(f"Tool started: {tool_name}")
+                yield {
+                    "type": "tool_start",
+                    "tool": tool_name,
+                    "session_id": session_id
+                }
+
+            elif kind == "on_tool_end":
+                tool_name = event.get("name", "unknown")
+                logger.info(f"Tool completed: {tool_name}")
+                yield {
+                    "type": "tool_end",
+                    "tool": tool_name,
+                    "session_id": session_id
+                }
+
+        logger.info("Streaming invocation completed")
+
+        # Save conversation turn to memory after streaming completes
+        if memory_manager and assistant_response:
+            try:
+                session = memory_manager.create_memory_session(
+                    actor_id=actor_id,
+                    session_id=session_id
+                )
+                session.add_turns([
+                    ConversationalMessage(prompt, MessageRole.USER),
+                    ConversationalMessage(assistant_response, MessageRole.ASSISTANT)
+                ])
+                logger.info("Saved conversation turn to AgentCore Memory")
+            except Exception as e:
+                logger.warning(f"Failed to save conversation turn to memory: {e}")
+
+        # Send final completion event
+        yield {
+            "type": "done",
+            "session_id": session_id,
+            "actor_id": actor_id
+        }
+
+    except Exception as e:
+        logger.error(f"Streaming invocation failed: {e}")
+        yield {
+            "type": "error",
+            "error": str(e),
+            "session_id": session_id
+        }
+
+
+async def _invoke_non_streaming(messages, config, session_id, actor_id, prompt):
+    """Handle non-streaming invocation."""
+    try:
+        logger.info("Starting non-streaming invocation")
+
         if config:
-            tmp_output = graph.invoke({"messages": messages}, config=config)
+            tmp_output = await graph.ainvoke({"messages": messages}, config=config)
         else:
-            tmp_output = graph.invoke({"messages": messages})
+            tmp_output = await graph.ainvoke({"messages": messages})
 
         logger.info("Graph invocation completed")
         logger.debug(f"Output: {tmp_output}")
@@ -210,7 +332,7 @@ def agent_invocation(payload, context):
         }
 
     except Exception as e:
-        logger.error(f"Graph invocation failed: {e}")
+        logger.error(f"Non-streaming invocation failed: {e}")
         raise
 
 

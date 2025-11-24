@@ -45,6 +45,20 @@ During configure, you'll be prompted for:
 
 For local development, you can store the Tavily API key in .env but for AWS, that won't work. In that case you can either use AWS secrets manager, or store it as an environmental variable in the Agent Runtime, under advanced configuration.
 
+## Testing local
+```
+curl -N -X POST http://localhost:8080/invocations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "What are 3 interesting facts about President Garfield?","session_id": "", "actor_id": "d100"}'
 
+```
+
+## Testing local steamed output
+```
+curl -N -X POST http://localhost:8080/invocations \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"prompt": "What are 3 interesting facts about President Arthur?","session_id": "", "actor_id": "d100", "stream": "True"}'
+```
 
 
