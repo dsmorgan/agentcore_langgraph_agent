@@ -35,7 +35,7 @@ langchain-aws==1.0.0
 langchain-classic==1.0.0
 langchain-community==0.4.1
 langchain-core==1.0.7
-langchain-tavily==0.2.1
+langchain-tavily==0.2.13
 langchain-text-splitters==1.0.0
 langgraph==1.0.3
 langgraph-checkpoint==3.0.1
