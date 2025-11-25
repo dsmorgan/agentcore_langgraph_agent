@@ -199,13 +199,33 @@ async def _stream_invocation(messages, config, session_id, actor_id, prompt):
 
         # Accumulate response for memory saving
         assistant_response = ""
+        validation_error_occurred = False
 
-        # Stream events from the graph
-        async for event in graph.astream_events(
-            {"messages": messages},
-            config=config if config else {},
-            version="v2"
-        ):
+        # Create wrapped event stream that handles Pydantic validation errors
+        async def safe_event_stream():
+            """Wrapper that catches and logs Pydantic validation errors from tool_call_chunks."""
+            nonlocal validation_error_occurred
+            try:
+                async for event in graph.astream_events(
+                    {"messages": messages},
+                    config=config if config else {},
+                    version="v2"
+                ):
+                    yield event
+            except Exception as e:
+                # Catch Pydantic validation errors that occur during stream iteration
+                error_msg = str(e)
+                if "validation error" in error_msg.lower() and "tool_call" in error_msg.lower():
+                    logger.warning(f"Caught tool_call_chunks validation error (LangChain/Bedrock streaming incompatibility): {e}")
+                    logger.warning("Falling back to non-streaming mode to complete request")
+                    validation_error_occurred = True
+                    return
+                else:
+                    # Re-raise other exceptions
+                    raise
+
+        # Stream events from the graph with error handling
+        async for event in safe_event_stream():
             kind = event.get("event")
 
             # Stream LLM token chunks to client
@@ -261,22 +281,64 @@ async def _stream_invocation(messages, config, session_id, actor_id, prompt):
                     "session_id": session_id
                 }
 
-        logger.info("Streaming invocation completed")
+        # If validation error occurred during streaming, fall back to non-streaming
+        if validation_error_occurred:
+            logger.info("Executing non-streaming fallback due to validation error")
 
-        # Save conversation turn to memory after streaming completes
-        if memory_manager and assistant_response:
+            # Indicate to client that fallback mode is starting
+            yield {
+                "type": "tool_start",
+                "tool": "non_streaming_fallback",
+                "session_id": session_id
+            }
+
             try:
-                session = memory_manager.create_memory_session(
-                    actor_id=actor_id,
-                    session_id=session_id
-                )
-                session.add_turns([
-                    ConversationalMessage(prompt, MessageRole.USER),
-                    ConversationalMessage(assistant_response, MessageRole.ASSISTANT)
-                ])
-                logger.info("Saved conversation turn to AgentCore Memory")
-            except Exception as e:
-                logger.warning(f"Failed to save conversation turn to memory: {e}")
+                # Use non-streaming invocation to get the response
+                result = await _invoke_non_streaming(messages, config, session_id, actor_id, prompt)
+
+                # Yield the result as a content chunk for consistency with streaming
+                if isinstance(result, dict) and "result" in result:
+                    yield {
+                        "type": "content_chunk",
+                        "content": result["result"],
+                        "session_id": session_id
+                    }
+                    assistant_response = result["result"]
+
+                logger.info("Non-streaming fallback completed successfully")
+
+                # Mark fallback as complete
+                yield {
+                    "type": "tool_end",
+                    "tool": "non_streaming_fallback",
+                    "session_id": session_id
+                }
+
+            except Exception as fallback_error:
+                logger.error(f"Non-streaming fallback also failed: {fallback_error}")
+                yield {
+                    "type": "error",
+                    "error": f"Both streaming and non-streaming failed: {str(fallback_error)}",
+                    "session_id": session_id
+                }
+                return
+        else:
+            logger.info("Streaming invocation completed")
+
+            # Save conversation turn to memory after streaming completes
+            if memory_manager and assistant_response:
+                try:
+                    session = memory_manager.create_memory_session(
+                        actor_id=actor_id,
+                        session_id=session_id
+                    )
+                    session.add_turns([
+                        ConversationalMessage(prompt, MessageRole.USER),
+                        ConversationalMessage(assistant_response, MessageRole.ASSISTANT)
+                    ])
+                    logger.info("Saved conversation turn to AgentCore Memory")
+                except Exception as e:
+                    logger.warning(f"Failed to save conversation turn to memory: {e}")
 
         # Send final completion event
         yield {
