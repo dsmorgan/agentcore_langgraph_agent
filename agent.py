@@ -2,6 +2,9 @@ import os
 import logging
 from typing import Annotated
 import uuid
+import json
+import time
+from datetime import datetime, timezone
 
 from langchain.chat_models import init_chat_model
 from typing_extensions import TypedDict
@@ -15,9 +18,52 @@ from bedrock_agentcore.memory.constants import ConversationalMessage, MessageRol
 
 from tools import load_search_tools
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+
+class StructuredFormatter(logging.Formatter):
+    """JSON formatter for CloudWatch Logs Insights compatibility."""
+
+    def format(self, record):
+        log_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+
+        # Add custom fields from record
+        if hasattr(record, 'session_id'):
+            log_data['session_id'] = record.session_id
+        if hasattr(record, 'actor_id'):
+            log_data['actor_id'] = record.actor_id
+        if hasattr(record, 'duration_ms'):
+            log_data['duration_ms'] = record.duration_ms
+        if hasattr(record, 'operation'):
+            log_data['operation'] = record.operation
+        if hasattr(record, 'tool_name'):
+            log_data['tool_name'] = record.tool_name
+        if hasattr(record, 'memory_count'):
+            log_data['memory_count'] = record.memory_count
+        if hasattr(record, 'stream_mode'):
+            log_data['stream_mode'] = record.stream_mode
+        if hasattr(record, 'error_type'):
+            log_data['error_type'] = record.error_type
+
+        # Add exception info if present
+        if record.exc_info:
+            log_data['exception'] = self.formatException(record.exc_info)
+
+        return json.dumps(log_data)
+
+
+# Configure structured JSON logging for CloudWatch
+handler = logging.StreamHandler()
+handler.setFormatter(StructuredFormatter())
 logger = logging.getLogger(__name__)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False  # Prevent duplicate logs
+
+# LangGraph debug logger (keep existing)
 langgraph_logger = logging.getLogger("langgraph")
 langgraph_logger.setLevel(logging.DEBUG)
 
@@ -126,6 +172,7 @@ async def agent_invocation(payload, context):
         "stream": false  # optional, defaults to false
     }
     """
+    invocation_start = time.time()
     logger.info("Received payload")
     logger.debug(f"Payload: {payload}")
 
@@ -135,7 +182,15 @@ async def agent_invocation(payload, context):
     prompt = payload.get("prompt", "No prompt found in input, please guide customer as to what tools can be used")
     stream_mode = payload.get("stream", False)
 
-    logger.info(f"Session: {session_id}, Actor: {actor_id}, Streaming: {stream_mode}")
+    logger.info(
+        f"Session: {session_id}, Actor: {actor_id}, Streaming: {stream_mode}",
+        extra={
+            'session_id': session_id,
+            'actor_id': actor_id,
+            'stream_mode': stream_mode,
+            'operation': 'session_start'
+        }
+    )
 
     # Prepare messages for graph invocation
     messages = [{"role": "user", "content": prompt}]
@@ -151,6 +206,7 @@ async def agent_invocation(payload, context):
     # Retrieve long-term memories if memory manager is available
     if memory_manager:
         try:
+            memory_start = time.time()
             session = memory_manager.create_memory_session(
                 actor_id=actor_id,
                 session_id=session_id
@@ -162,9 +218,19 @@ async def agent_invocation(payload, context):
                 namespace_prefix=f"/users/{actor_id}",
                 top_k=5
             )
+            memory_duration = (time.time() - memory_start) * 1000  # Convert to ms
 
             if memories:
-                logger.info(f"Retrieved {len(memories)} long-term memories")
+                logger.info(
+                    f"Retrieved {len(memories)} long-term memories in {memory_duration:.2f}ms",
+                    extra={
+                        'session_id': session_id,
+                        'actor_id': actor_id,
+                        'memory_count': len(memories),
+                        'duration_ms': memory_duration,
+                        'operation': 'memory_retrieval'
+                    }
+                )
                 memory_context = "\n".join([
                     m.get("content", {}).get("text", "")
                     for m in memories if m.get("content", {}).get("text")
@@ -175,24 +241,43 @@ async def agent_invocation(payload, context):
                         "role": "system",
                         "content": f"Relevant context from memory:\n{memory_context}"
                     })
+            else:
+                logger.info(
+                    f"No long-term memories found ({memory_duration:.2f}ms)",
+                    extra={
+                        'session_id': session_id,
+                        'actor_id': actor_id,
+                        'memory_count': 0,
+                        'duration_ms': memory_duration,
+                        'operation': 'memory_retrieval'
+                    }
+                )
 
         except Exception as e:
-            logger.warning(f"Failed to retrieve long-term memories: {e}")
+            logger.warning(
+                f"Failed to retrieve long-term memories: {e}",
+                extra={
+                    'session_id': session_id,
+                    'actor_id': actor_id,
+                    'operation': 'memory_retrieval',
+                    'error_type': type(e).__name__
+                }
+            )
 
     # Route to streaming or non-streaming handler
     if stream_mode:
         # Streaming mode: use async generator - must yield all events
-        async for event in _stream_invocation(messages, config, session_id, actor_id, prompt):
+        async for event in _stream_invocation(messages, config, session_id, actor_id, prompt, invocation_start):
             yield event
         # In streaming mode, we don't return - just finish the generator
     else:
         # Non-streaming mode: delegate to separate function and yield single result
         # This allows the function to work as both generator and regular async function
-        result = await _invoke_non_streaming(messages, config, session_id, actor_id, prompt)
+        result = await _invoke_non_streaming(messages, config, session_id, actor_id, prompt, invocation_start)
         yield result
 
 
-async def _stream_invocation(messages, config, session_id, actor_id, prompt):
+async def _stream_invocation(messages, config, session_id, actor_id, prompt, invocation_start):
     """Handle streaming invocation."""
     try:
         logger.info("Starting streaming invocation")
@@ -200,6 +285,7 @@ async def _stream_invocation(messages, config, session_id, actor_id, prompt):
         # Accumulate response for memory saving
         assistant_response = ""
         validation_error_occurred = False
+        tool_timings = {}  # Track tool execution start times
 
         # Create wrapped event stream that handles Pydantic validation errors
         async def safe_event_stream():
@@ -265,7 +351,15 @@ async def _stream_invocation(messages, config, session_id, actor_id, prompt):
             # Show tool execution status (optional visibility)
             elif kind == "on_tool_start":
                 tool_name = event.get("name", "unknown")
-                logger.info(f"Tool started: {tool_name}")
+                tool_timings[tool_name] = time.time()
+                logger.info(
+                    f"Tool started: {tool_name}",
+                    extra={
+                        'session_id': session_id,
+                        'tool_name': tool_name,
+                        'operation': 'tool_start'
+                    }
+                )
                 yield {
                     "type": "tool_start",
                     "tool": tool_name,
@@ -274,7 +368,16 @@ async def _stream_invocation(messages, config, session_id, actor_id, prompt):
 
             elif kind == "on_tool_end":
                 tool_name = event.get("name", "unknown")
-                logger.info(f"Tool completed: {tool_name}")
+                duration_ms = (time.time() - tool_timings.get(tool_name, time.time())) * 1000
+                logger.info(
+                    f"Tool completed: {tool_name} in {duration_ms:.2f}ms",
+                    extra={
+                        'session_id': session_id,
+                        'tool_name': tool_name,
+                        'duration_ms': duration_ms,
+                        'operation': 'tool_end'
+                    }
+                )
                 yield {
                     "type": "tool_end",
                     "tool": tool_name,
@@ -328,6 +431,7 @@ async def _stream_invocation(messages, config, session_id, actor_id, prompt):
             # Save conversation turn to memory after streaming completes
             if memory_manager and assistant_response:
                 try:
+                    save_start = time.time()
                     session = memory_manager.create_memory_session(
                         actor_id=actor_id,
                         session_id=session_id
@@ -336,11 +440,39 @@ async def _stream_invocation(messages, config, session_id, actor_id, prompt):
                         ConversationalMessage(prompt, MessageRole.USER),
                         ConversationalMessage(assistant_response, MessageRole.ASSISTANT)
                     ])
-                    logger.info("Saved conversation turn to AgentCore Memory")
+                    save_duration = (time.time() - save_start) * 1000
+                    logger.info(
+                        f"Saved conversation turn to AgentCore Memory in {save_duration:.2f}ms",
+                        extra={
+                            'session_id': session_id,
+                            'actor_id': actor_id,
+                            'duration_ms': save_duration,
+                            'operation': 'memory_save'
+                        }
+                    )
                 except Exception as e:
-                    logger.warning(f"Failed to save conversation turn to memory: {e}")
+                    logger.warning(
+                        f"Failed to save conversation turn to memory: {e}",
+                        extra={
+                            'session_id': session_id,
+                            'actor_id': actor_id,
+                            'operation': 'memory_save',
+                            'error_type': type(e).__name__
+                        }
+                    )
 
         # Send final completion event
+        invocation_duration = (time.time() - invocation_start) * 1000
+        logger.info(
+            f"Invocation completed in {invocation_duration:.2f}ms",
+            extra={
+                'session_id': session_id,
+                'actor_id': actor_id,
+                'duration_ms': invocation_duration,
+                'stream_mode': True,
+                'operation': 'invocation_complete'
+            }
+        )
         yield {
             "type": "done",
             "session_id": session_id,
@@ -356,7 +488,7 @@ async def _stream_invocation(messages, config, session_id, actor_id, prompt):
         }
 
 
-async def _invoke_non_streaming(messages, config, session_id, actor_id, prompt):
+async def _invoke_non_streaming(messages, config, session_id, actor_id, prompt, invocation_start):
     """Handle non-streaming invocation."""
     try:
         logger.info("Starting non-streaming invocation")
@@ -375,6 +507,7 @@ async def _invoke_non_streaming(messages, config, session_id, actor_id, prompt):
         # Save conversation turn to memory if memory manager is available
         if memory_manager:
             try:
+                save_start = time.time()
                 session = memory_manager.create_memory_session(
                     actor_id=actor_id,
                     session_id=session_id
@@ -383,9 +516,38 @@ async def _invoke_non_streaming(messages, config, session_id, actor_id, prompt):
                     ConversationalMessage(prompt, MessageRole.USER),
                     ConversationalMessage(assistant_response, MessageRole.ASSISTANT)
                 ])
-                logger.info("Saved conversation turn to AgentCore Memory")
+                save_duration = (time.time() - save_start) * 1000
+                logger.info(
+                    f"Saved conversation turn to AgentCore Memory in {save_duration:.2f}ms",
+                    extra={
+                        'session_id': session_id,
+                        'actor_id': actor_id,
+                        'duration_ms': save_duration,
+                        'operation': 'memory_save'
+                    }
+                )
             except Exception as e:
-                logger.warning(f"Failed to save conversation turn to memory: {e}")
+                logger.warning(
+                    f"Failed to save conversation turn to memory: {e}",
+                    extra={
+                        'session_id': session_id,
+                        'actor_id': actor_id,
+                        'operation': 'memory_save',
+                        'error_type': type(e).__name__
+                    }
+                )
+
+        invocation_duration = (time.time() - invocation_start) * 1000
+        logger.info(
+            f"Invocation completed in {invocation_duration:.2f}ms",
+            extra={
+                'session_id': session_id,
+                'actor_id': actor_id,
+                'duration_ms': invocation_duration,
+                'stream_mode': False,
+                'operation': 'invocation_complete'
+            }
+        )
 
         return {
             "result": assistant_response,
