@@ -114,6 +114,53 @@
             font-weight: 500;
         }
 
+        .radio-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-top: 8px;
+        }
+
+        .radio-option {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            background: white;
+        }
+
+        .radio-option:hover {
+            border-color: #3498db;
+            background: #f0f8ff;
+        }
+
+        .radio-option input[type="radio"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+            margin: 0;
+        }
+
+        .radio-option input[type="radio"]:checked + span {
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .radio-option:has(input[type="radio"]:checked) {
+            border-color: #3498db;
+            background: #e3f2fd;
+        }
+
+        .radio-option span {
+            font-weight: 500;
+            color: #34495e;
+            user-select: none;
+        }
+
         .sidebar-footer {
             padding: 20px;
             border-top: 1px solid #ddd;
@@ -476,6 +523,23 @@
                     </div>
 
                     <div class="control-group">
+                        <label>Environment</label>
+                        <div class="radio-group">
+                            <label class="radio-option">
+                                <input type="radio" name="environment" value="local" checked>
+                                <span>Local Development</span>
+                            </label>
+                            <label class="radio-option">
+                                <input type="radio" name="environment" value="aws">
+                                <span>AWS Bedrock AgentCore</span>
+                            </label>
+                        </div>
+                        <small style="color: #666; font-size: 12px; margin-top: 8px; display: block;">
+                            AWS region and agent ID auto-detected from .bedrock_agentcore.yaml
+                        </small>
+                    </div>
+
+                    <div class="control-group">
                         <label for="sessionId">Session ID (leave blank for new session)</label>
                         <input type="text" id="sessionId" value="" placeholder="Auto-generated if blank">
                     </div>
@@ -694,11 +758,19 @@
 
         async function sendNonStreamedRequest(endpoint, payload) {
             try {
+                const headers = {
+                    'Content-Type': 'application/json',
+                };
+
+                // Add environment header if AWS is selected
+                const selectedEnv = document.querySelector('input[name="environment"]:checked').value;
+                if (selectedEnv === 'aws') {
+                    headers['X-Target-Environment'] = 'aws';
+                }
+
                 const response = await fetch(endpoint, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: headers,
                     body: JSON.stringify(payload)
                 });
 
@@ -726,11 +798,19 @@
 
         async function sendStreamedRequest(endpoint, payload) {
             try {
+                const headers = {
+                    'Content-Type': 'application/json',
+                };
+
+                // Add environment header if AWS is selected
+                const selectedEnv = document.querySelector('input[name="environment"]:checked').value;
+                if (selectedEnv === 'aws') {
+                    headers['X-Target-Environment'] = 'aws';
+                }
+
                 const response = await fetch(endpoint, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: headers,
                     body: JSON.stringify({ ...payload, stream: true })
                 });
 

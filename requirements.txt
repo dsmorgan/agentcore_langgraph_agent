@@ -76,6 +76,9 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
 pyyaml==6.0.3
 questionary==2.1.1
+requests-aws4auth==1.2.3
+flask==3.0.0
+flask-cors==4.0.0
 referencing==0.36.2
 regex==2025.11.3
 requests==2.32.5
